@@ -1,31 +1,10 @@
 'use client'
 
-import { useMemo, useState } from 'react'
+import { ChangeEvent, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Activity,
-  ChevronDown,
-  CircleHelp,
-  Download,
-  FolderOpen,
-  Gauge,
-  Headphones,
-  KeyboardMusic,
-  Layers3,
-  Menu,
-  Mic2,
-  MoreHorizontal,
-  Pause,
-  Play,
-  Plus,
-  Save,
-  Settings2,
-  SlidersHorizontal,
-  Sparkles,
-  Square,
-  Undo2,
-  Volume2,
-  WandSparkles,
-  Zap,
+  Activity, ChevronDown, CircleHelp, Download, FileAudio, FolderOpen, Gauge,
+  Headphones, KeyboardMusic, Menu, Pause, Play, Plus, Save, Settings2,
+  SlidersHorizontal, Sparkles, Square, Undo2, Upload, Volume2, WandSparkles, Zap,
 } from 'lucide-react'
 
 const steps = Array.from({ length: 32 }, (_, index) => index)
@@ -36,87 +15,90 @@ const tracks = [
   { name: 'PERC', sub: 'Industrial perc', tone: 'bg-violet-400/10 text-violet-300', active: 'border-violet-300/50 bg-violet-400', meter: 'bg-violet-400', pattern: [3, 7, 11, 15, 19, 23, 27, 31] },
 ]
 
+function writeWav(samples: Float32Array, sampleRate = 48000) {
+  const buffer = new ArrayBuffer(44 + samples.length * 4)
+  const view = new DataView(buffer)
+  const text = (offset: number, value: string) => [...value].forEach((char, index) => view.setUint8(offset + index, char.charCodeAt(0)))
+  text(0, 'RIFF'); view.setUint32(4, 36 + samples.length * 4, true); text(8, 'WAVE'); text(12, 'fmt ')
+  view.setUint32(16, 16, true); view.setUint16(20, 3, true); view.setUint16(22, 1, true); view.setUint32(24, sampleRate, true)
+  view.setUint32(28, sampleRate * 4, true); view.setUint16(32, 4, true); view.setUint16(34, 32, true); text(36, 'data'); view.setUint32(40, samples.length * 4, true)
+  samples.forEach((sample, index) => view.setFloat32(44 + index * 4, Math.max(-1, Math.min(1, sample)), true))
+  return new Blob([buffer], { type: 'audio/wav' })
+}
+
+function downloadBlob(blob: Blob, filename: string) {
+  const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = filename; link.click(); URL.revokeObjectURL(link.href)
+}
+
 export default function Page() {
   const [playing, setPlaying] = useState(false)
   const [activeTab, setActiveTab] = useState<'mix' | 'master'>('mix')
-  const [activeSteps, setActiveSteps] = useState<Record<string, number[]>>(
-    Object.fromEntries(tracks.map((track) => [track.name, track.pattern])),
-  )
+  const [activeSteps, setActiveSteps] = useState<Record<string, number[]>>(Object.fromEntries(tracks.map((track) => [track.name, track.pattern])))
   const [muted, setMuted] = useState<string[]>([])
   const [solo, setSolo] = useState<string[]>([])
   const [tempo, setTempo] = useState(155)
-
+  const [masterGain, setMasterGain] = useState(0)
+  const [threshold, setThreshold] = useState(-8)
+  const [release, setRelease] = useState(80)
+  const [sourceName, setSourceName] = useState('Ningún archivo cargado')
+  const [sourceBuffer, setSourceBuffer] = useState<AudioBuffer | null>(null)
+  const [status, setStatus] = useState('Listo para producir')
+  const audioContext = useRef<AudioContext | null>(null)
+  const nodes = useRef<OscillatorNode[]>([])
   const totalHits = useMemo(() => Object.values(activeSteps).flat().length, [activeSteps])
 
-  function toggleStep(trackName: string, step: number) {
-    setActiveSteps((current) => {
-      const next = new Set(current[trackName])
-      next.has(step) ? next.delete(step) : next.add(step)
-      return { ...current, [trackName]: [...next] }
-    })
+  useEffect(() => () => nodes.current.forEach((node) => { try { node.stop() } catch {} }), [])
+
+  function toggleStep(trackName: string, step: number) { setActiveSteps((current) => { const next = new Set(current[trackName]); next.has(step) ? next.delete(step) : next.add(step); return { ...current, [trackName]: [...next] } }) }
+  function toggleList(setter: typeof setMuted, values: string[], value: string) { setter(values.includes(value) ? values.filter((item) => item !== value) : [...values, value]) }
+  function triggerSound(trackName: string, time: number, context: AudioContext | OfflineAudioContext, destination: AudioNode) {
+    if (muted.includes(trackName) || (solo.length && !solo.includes(trackName))) return
+    const oscillator = context.createOscillator(); const gain = context.createGain(); const filter = context.createBiquadFilter()
+    oscillator.type = trackName === 'KICK' ? 'sine' : trackName === 'HAT' ? 'square' : 'triangle'
+    oscillator.frequency.setValueAtTime(trackName === 'KICK' ? 150 : trackName === 'CLAP' ? 900 : trackName === 'HAT' ? 5000 : 700, time)
+    oscillator.frequency.exponentialRampToValueAtTime(trackName === 'KICK' ? 48 : 220, time + (trackName === 'KICK' ? 0.16 : 0.05))
+    filter.type = 'lowpass'; filter.frequency.value = trackName === 'HAT' ? 9000 : 2200
+    gain.gain.setValueAtTime(0.001, time); gain.gain.exponentialRampToValueAtTime(trackName === 'KICK' ? 0.95 : 0.25, time + 0.004); gain.gain.exponentialRampToValueAtTime(0.001, time + (trackName === 'KICK' ? 0.22 : 0.09))
+    oscillator.connect(filter).connect(gain).connect(destination); oscillator.start(time); oscillator.stop(time + 0.25)
+    if (context instanceof AudioContext) nodes.current.push(oscillator)
+  }
+  function playPattern() {
+    const context = audioContext.current ?? new AudioContext(); audioContext.current = context
+    if (playing) { nodes.current.forEach((node) => { try { node.stop() } catch {} }); nodes.current = []; setPlaying(false); return }
+    const start = context.currentTime + 0.04; const stepLength = 60 / Math.max(60, tempo) / 4
+    tracks.forEach((track) => activeSteps[track.name].forEach((step) => triggerSound(track.name, start + step * stepLength, context, context.destination)))
+    setPlaying(true); setStatus('Reproduciendo patrón')
+    window.setTimeout(() => { setPlaying(false); setStatus('Listo para producir') }, Math.max(1000, stepLength * 32 * 1000 + 300))
+  }
+  function exportPattern() {
+    const rate = 48000; const seconds = 8; const offline = new OfflineAudioContext(1, rate * seconds, rate); const master = offline.createGain(); master.gain.value = Math.pow(10, masterGain / 20); master.connect(offline.destination)
+    const stepLength = 60 / Math.max(60, tempo) / 4; tracks.forEach((track) => activeSteps[track.name].forEach((step) => triggerSound(track.name, step * stepLength, offline, master)))
+    offline.startRendering().then((rendered) => { downloadBlob(writeWav(rendered.getChannelData(0), rate), 'pulse-lab-hardstyle-48k-32bit.wav'); setStatus('Exportación WAV completada') })
+  }
+  async function loadAudio(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0]; if (!file) return; const context = audioContext.current ?? new AudioContext(); audioContext.current = context
+    setSourceName(file.name); setSourceBuffer(await context.decodeAudioData(await file.arrayBuffer())); setStatus('Pista lista para masterizar')
+  }
+  async function exportMaster() {
+    if (!sourceBuffer) { setStatus('Carga una pista WAV o MP3 primero'); return }
+    const rate = 48000; const offline = new OfflineAudioContext(1, Math.ceil(sourceBuffer.duration * rate), rate); const source = offline.createBufferSource(); source.buffer = sourceBuffer
+    const high = offline.createBiquadFilter(); high.type = 'highshelf'; high.frequency.value = 7000; high.gain.value = 1.5
+    const compressor = offline.createDynamicsCompressor(); compressor.threshold.value = threshold; compressor.knee.value = 8; compressor.ratio.value = 8; compressor.attack.value = 0.003; compressor.release.value = release / 1000
+    const gain = offline.createGain(); gain.gain.value = Math.pow(10, masterGain / 20); source.connect(high).connect(compressor).connect(gain).connect(offline.destination); source.start()
+    setStatus('Renderizando master WAV 48 kHz / 32-bit…'); const rendered = await offline.startRendering(); downloadBlob(writeWav(rendered.getChannelData(0), rate), 'pulse-lab-master-48k-32bit.wav'); setStatus('Master exportado correctamente')
   }
 
-  function toggleList(setter: typeof setMuted, values: string[], value: string) {
-    setter(values.includes(value) ? values.filter((item) => item !== value) : [...values, value])
-  }
-
-  return (
-    <main className="min-h-screen bg-[#090a0f] text-slate-100 selection:bg-fuchsia-400/30">
-      <header className="flex h-16 items-center justify-between border-b border-white/[0.08] bg-[#0d0e14] px-4 lg:px-7">
-        <div className="flex items-center gap-7">
-          <div className="flex items-center gap-2.5">
-            <div className="flex size-8 items-center justify-center rounded-lg bg-fuchsia-500 text-white shadow-[0_0_22px_rgba(217,70,239,0.5)]"><Zap className="size-4 fill-current" /></div>
-            <span className="text-lg font-bold tracking-tight">PULSE<span className="text-fuchsia-400">//</span>LAB</span>
-          </div>
-          <div className="hidden items-center gap-1 text-sm text-slate-400 md:flex">
-            <button className="flex items-center gap-1 rounded-md px-3 py-2 hover:bg-white/5 hover:text-white">Archivo <ChevronDown className="size-3.5" /></button>
-            <button className="flex items-center gap-1 rounded-md px-3 py-2 hover:bg-white/5 hover:text-white">Editar <ChevronDown className="size-3.5" /></button>
-            <button className="flex items-center gap-1 rounded-md px-3 py-2 hover:bg-white/5 hover:text-white">Proyecto <ChevronDown className="size-3.5" /></button>
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          <button className="hidden items-center gap-2 rounded-md border border-white/10 px-3 py-2 text-xs text-slate-300 hover:bg-white/5 sm:flex"><Save className="size-3.5" /> Guardar</button>
-          <button className="flex items-center gap-2 rounded-md bg-fuchsia-500 px-3 py-2 text-xs font-semibold text-white shadow-[0_0_18px_rgba(217,70,239,0.22)] hover:bg-fuchsia-400"><Download className="size-3.5" /> Exportar WAV</button>
-          <button className="rounded-md p-2 text-slate-400 hover:bg-white/5 hover:text-white"><Menu className="size-5" /></button>
-        </div>
-      </header>
-
-      <section className="border-b border-white/[0.08] bg-[#101118] px-4 py-3 lg:px-7">
-        <div className="mx-auto flex max-w-[1500px] flex-wrap items-center justify-between gap-4">
-          <div className="flex items-center gap-2">
-            <button aria-label="Open project" className="rounded-md border border-white/10 p-2 text-slate-400 hover:text-white"><FolderOpen className="size-4" /></button>
-            <div className="ml-2"><p className="text-[10px] uppercase tracking-[0.2em] text-slate-500">Proyecto</p><p className="text-sm font-medium text-slate-200">NEON RITUAL <span className="text-slate-500">/ Demo 01</span></p></div>
-          </div>
-          <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-[#171821] p-1.5">
-            <button onClick={() => setPlaying(false)} aria-label="Stop" className="rounded-lg p-2 text-slate-400 hover:bg-white/5 hover:text-white"><Square className="size-3.5 fill-current" /></button>
-            <button onClick={() => setPlaying(!playing)} aria-label={playing ? 'Pause' : 'Play'} className="flex size-9 items-center justify-center rounded-lg bg-fuchsia-500 text-white shadow-[0_0_15px_rgba(217,70,239,0.35)] hover:bg-fuchsia-400">{playing ? <Pause className="size-4 fill-current" /> : <Play className="size-4 fill-current" />}</button>
-            <div className="mx-2 h-6 w-px bg-white/10" />
-            <label className="flex items-center gap-2 px-2 text-xs text-slate-400"><span className="uppercase tracking-wider">BPM</span><input aria-label="Tempo" type="number" value={tempo} onChange={(event) => setTempo(Number(event.target.value))} className="w-12 bg-transparent text-center font-mono text-sm font-semibold text-white outline-none" /></label>
-          </div>
-          <div className="flex items-center gap-5 font-mono text-xs text-slate-500"><span>4/4</span><span className="text-slate-300">01:24:08</span><span className="flex items-center gap-1.5 text-emerald-400"><span className="size-1.5 rounded-full bg-emerald-400 shadow-[0_0_8px_#34d399]" /> Auto-saved</span></div>
-        </div>
-      </section>
-
-      <div className="mx-auto grid max-w-[1500px] gap-5 p-4 lg:grid-cols-[1fr_310px] lg:p-7">
-        <div className="min-w-0">
-          <div className="mb-4 flex items-end justify-between"><div><p className="mb-1 text-xs font-medium uppercase tracking-[0.24em] text-fuchsia-400">Pattern editor</p><h1 className="text-2xl font-semibold tracking-tight">Hardstyle foundation</h1></div><div className="flex gap-2"><button className="rounded-md border border-white/10 p-2 text-slate-400 hover:text-white"><Undo2 className="size-4" /></button><button className="rounded-md border border-white/10 p-2 text-slate-400 hover:text-white"><Settings2 className="size-4" /></button></div></div>
-          <section className="overflow-hidden rounded-xl border border-white/[0.09] bg-[#11121a] shadow-2xl">
-            <div className="flex min-w-[850px] items-center border-b border-white/[0.08] bg-[#171821] px-4 py-3 text-[10px] font-medium uppercase tracking-[0.18em] text-slate-500"><div className="w-40">Tracks</div><div className="flex flex-1 justify-between pr-1">{[1, 2, 3, 4, 5, 6, 7, 8].map((bar) => <span key={bar} className={bar === 1 ? 'text-fuchsia-400' : ''}>{bar}</span>)}</div></div>
-            <div className="min-w-[850px] p-4">
-              {tracks.map((track) => <div key={track.name} className="flex h-20 items-center border-b border-white/[0.05] last:border-b-0"><div className="flex w-40 shrink-0 items-center gap-3"><div className={`flex size-8 items-center justify-center rounded-md ${track.tone}`}><Activity className="size-4" /></div><div><p className="text-xs font-semibold tracking-wider text-slate-200">{track.name}</p><p className="text-[10px] text-slate-500">{track.sub}</p></div></div><div className="grid flex-1 grid-cols-32 gap-1">{steps.map((step) => { const isActive = activeSteps[track.name].includes(step); const isBeat = step % 4 === 0; return <button key={step} aria-label={`${track.name} step ${step + 1}`} onClick={() => toggleStep(track.name, step)} className={`h-11 rounded-sm border transition-all ${isActive ? `${track.active} shadow-[0_0_12px_rgba(244,63,94,0.32)]` : `border-white/[0.06] ${isBeat ? 'bg-white/[0.06]' : 'bg-white/[0.025]'} hover:bg-white/10`}`} /> })}</div></div>)}
-            </div>
-            <div className="flex min-w-[850px] items-center justify-between border-t border-white/[0.08] bg-[#0d0e14] px-4 py-3"><span className="text-xs text-slate-500">{totalHits} pasos activos</span><button className="flex items-center gap-2 rounded-md border border-white/10 px-3 py-2 text-xs text-slate-300 hover:bg-white/5"><Plus className="size-3.5" /> Añadir pista</button></div>
-          </section>
-
-          <div className="mt-5 grid gap-5 md:grid-cols-2">
-            <section className="rounded-xl border border-white/[0.09] bg-[#11121a] p-5"><div className="mb-5 flex items-center justify-between"><div><p className="text-xs font-medium uppercase tracking-[0.18em] text-cyan-300">Synthesis</p><h2 className="mt-1 font-semibold">Punch Generator</h2></div><KeyboardMusic className="size-5 text-cyan-300" /></div><div className="grid grid-cols-3 gap-4">{[['Pitch', '48%'], ['Drive', '72%'], ['Click', '36%']].map(([label, value]) => <div key={label}><div className="mb-2 flex justify-between text-[10px] uppercase tracking-wider text-slate-500"><span>{label}</span><span className="font-mono text-cyan-300">{value}</span></div><div className="h-1.5 rounded-full bg-white/10"><div className="h-full rounded-full bg-cyan-400" style={{ width: value }} /></div></div>)}</div><button className="mt-6 flex w-full items-center justify-center gap-2 rounded-md border border-cyan-400/20 bg-cyan-400/10 py-2 text-xs font-medium text-cyan-300 hover:bg-cyan-400/20"><WandSparkles className="size-3.5" /> Generar variación</button></section>
-            <section className="rounded-xl border border-white/[0.09] bg-[#11121a] p-5"><div className="mb-5 flex items-center justify-between"><div><p className="text-xs font-medium uppercase tracking-[0.18em] text-amber-300">Master bus</p><h2 className="mt-1 font-semibold">Control room</h2></div><Gauge className="size-5 text-amber-300" /></div><div className="flex items-end justify-around gap-4"><div className="flex h-20 w-2 flex-col justify-end rounded-full bg-white/10"><div className="h-[72%] rounded-full bg-gradient-to-t from-amber-400 to-rose-400" /></div><div className="flex-1"><p className="text-[10px] uppercase tracking-wider text-slate-500">Loudness</p><p className="mt-1 font-mono text-xl">-8.2 <span className="text-xs text-slate-500">LUFS</span></p><div className="mt-3 h-1 rounded-full bg-white/10"><div className="h-full w-[78%] rounded-full bg-amber-400" /></div></div><div className="text-right"><p className="text-[10px] uppercase tracking-wider text-slate-500">Ceiling</p><p className="mt-1 font-mono text-xl">-0.3 <span className="text-xs text-slate-500">dB</span></p></div></div><button className="mt-6 flex w-full items-center justify-center gap-2 rounded-md border border-amber-400/20 bg-amber-400/10 py-2 text-xs font-medium text-amber-300 hover:bg-amber-400/20"><Sparkles className="size-3.5" /> Master assistant</button></section>
-          </div>
-        </div>
-
-        <aside className="rounded-xl border border-white/[0.09] bg-[#11121a] p-5"><div className="mb-5 flex items-center justify-between"><div><p className="text-xs font-medium uppercase tracking-[0.18em] text-fuchsia-400">Studio rack</p><h2 className="mt-1 text-lg font-semibold">{activeTab === 'mix' ? 'Mixer' : 'Mastering'}</h2></div><SlidersHorizontal className="size-5 text-slate-400" /></div><div className="mb-5 flex rounded-lg bg-[#0b0c11] p-1"><button onClick={() => setActiveTab('mix')} className={`flex-1 rounded-md py-2 text-xs font-medium ${activeTab === 'mix' ? 'bg-white/10 text-white' : 'text-slate-500'}`}>Mezcla</button><button onClick={() => setActiveTab('master')} className={`flex-1 rounded-md py-2 text-xs font-medium ${activeTab === 'master' ? 'bg-white/10 text-white' : 'text-slate-500'}`}>Master</button></div>{activeTab === 'mix' ? <div className="flex flex-col gap-3">{tracks.map((track) => <div key={track.name} className="rounded-lg border border-white/[0.07] bg-[#171821] p-3"><div className="mb-3 flex items-center justify-between"><span className="text-xs font-semibold tracking-widest text-slate-200">{track.name}</span><div className="flex gap-1"><button onClick={() => toggleList(setMuted, muted, track.name)} className={`rounded px-1.5 py-1 text-[9px] font-bold ${muted.includes(track.name) ? 'bg-rose-500 text-white' : 'text-slate-500 hover:bg-white/10'}`}>M</button><button onClick={() => toggleList(setSolo, solo, track.name)} className={`rounded px-1.5 py-1 text-[9px] font-bold ${solo.includes(track.name) ? 'bg-amber-400 text-black' : 'text-slate-500 hover:bg-white/10'}`}>S</button></div></div><div className="flex items-center gap-3"><Volume2 className="size-3.5 text-slate-500" /><div className="h-1.5 flex-1 rounded-full bg-white/10"><div className={`h-full rounded-full ${track.meter}`} style={{ width: `${track.name === 'KICK' ? 86 : track.name === 'CLAP' ? 70 : 58}%` }} /></div><span className="w-8 text-right font-mono text-[10px] text-slate-500">{track.name === 'KICK' ? '-1.2' : '-4.0'}</span></div></div>)}</div> : <div className="flex flex-col gap-4">{[['EQ curve', 'Wide presence'], ['Glue compressor', '2:1 • Soft knee'], ['Limiter', 'True peak -0.3 dB']].map(([name, value]) => <div key={name} className="rounded-lg border border-white/[0.07] bg-[#171821] p-4"><div className="flex items-center gap-3"><div className="flex size-8 items-center justify-center rounded-md bg-amber-400/10 text-amber-300"><Gauge className="size-4" /></div><div><p className="text-xs font-semibold text-slate-200">{name}</p><p className="text-[10px] text-slate-500">{value}</p></div><span className="ml-auto size-2 rounded-full bg-emerald-400" /></div><div className="mt-4 h-1 rounded-full bg-white/10"><div className="h-full w-3/4 rounded-full bg-amber-300" /></div></div>)}<button className="flex items-center justify-center gap-2 rounded-md border border-white/10 py-2.5 text-xs text-slate-300 hover:bg-white/5"><Plus className="size-3.5" /> Añadir efecto</button></div>}<div className="mt-6 border-t border-white/[0.08] pt-5"><div className="mb-3 flex items-center justify-between"><span className="text-xs font-medium text-slate-300">Master output</span><span className="font-mono text-[10px] text-emerald-400">-0.3 dB</span></div><div className="flex h-16 items-end gap-1 rounded-md bg-[#0b0c11] px-3 py-2">{Array.from({ length: 38 }, (_, index) => <span key={index} className={`flex-1 rounded-t-sm ${index > 33 ? 'bg-rose-400' : 'bg-fuchsia-400/80'}`} style={{ height: `${25 + ((index * 17) % 60)}%` }} />)}</div></div><button className="mt-5 flex w-full items-center justify-center gap-2 rounded-lg bg-fuchsia-500 py-3 text-sm font-semibold text-white shadow-[0_0_20px_rgba(217,70,239,0.18)] hover:bg-fuchsia-400"><Download className="size-4" /> Exportar mezcla WAV</button><p className="mt-3 text-center text-[10px] text-slate-500">WAV · 24-bit · 48 kHz · -14 LUFS</p></aside>
-      </div>
-      <footer className="mx-auto flex max-w-[1500px] items-center justify-between border-t border-white/[0.08] px-4 py-5 text-[10px] text-slate-600 lg:px-7"><span className="flex items-center gap-2"><Headphones className="size-3.5" /> Atajos: Espacio para reproducir · M para silenciar</span><span className="flex items-center gap-2"><CircleHelp className="size-3.5" /> Ayuda del estudio</span></footer>
-    </main>
-  )
+  return <main className="min-h-screen bg-[#090a0f] text-slate-100 selection:bg-fuchsia-400/30">
+    <header className="flex h-16 items-center justify-between border-b border-white/[0.08] bg-[#0d0e14] px-4 lg:px-7"><div className="flex items-center gap-7"><div className="flex items-center gap-2.5"><div className="flex size-8 items-center justify-center rounded-lg bg-fuchsia-500 text-white shadow-[0_0_22px_rgba(217,70,239,0.5)]"><Zap className="size-4 fill-current" /></div><span className="text-lg font-bold tracking-tight">PULSE<span className="text-fuchsia-400">//</span>LAB</span></div><div className="hidden items-center gap-1 text-sm text-slate-400 md:flex"><button className="flex items-center gap-1 rounded-md px-3 py-2 hover:bg-white/5 hover:text-white">Archivo <ChevronDown className="size-3.5" /></button><button className="flex items-center gap-1 rounded-md px-3 py-2 hover:bg-white/5 hover:text-white">Editar <ChevronDown className="size-3.5" /></button><button className="flex items-center gap-1 rounded-md px-3 py-2 hover:bg-white/5 hover:text-white">Proyecto <ChevronDown className="size-3.5" /></button></div></div><div className="flex items-center gap-2"><button className="hidden items-center gap-2 rounded-md border border-white/10 px-3 py-2 text-xs text-slate-300 hover:bg-white/5 sm:flex" onClick={() => setStatus('Proyecto guardado localmente')}><Save className="size-3.5" /> Guardar</button><button onClick={activeTab === 'master' ? exportMaster : exportPattern} className="flex items-center gap-2 rounded-md bg-fuchsia-500 px-3 py-2 text-xs font-semibold text-white shadow-[0_0_18px_rgba(217,70,239,0.22)] hover:bg-fuchsia-400"><Download className="size-3.5" /> Exportar WAV</button><button className="rounded-md p-2 text-slate-400 hover:bg-white/5 hover:text-white"><Menu className="size-5" /></button></div></header>
+    <section className="border-b border-white/[0.08] bg-[#101118] px-4 py-3 lg:px-7"><div className="mx-auto flex max-w-[1500px] flex-wrap items-center justify-between gap-4"><div className="flex items-center gap-2"><button aria-label="Abrir proyecto" className="rounded-md border border-white/10 p-2 text-slate-400 hover:text-white"><FolderOpen className="size-4" /></button><div className="ml-2"><p className="text-[10px] uppercase tracking-[0.2em] text-slate-500">Proyecto</p><p className="text-sm font-medium text-slate-200">NEON RITUAL <span className="text-slate-500">/ Demo 01</span></p></div></div><div className="flex items-center gap-2 rounded-xl border border-white/10 bg-[#171821] p-1.5"><button onClick={() => { setPlaying(false); nodes.current.forEach((node) => { try { node.stop() } catch {} }); nodes.current = [] }} aria-label="Detener" className="rounded-lg p-2 text-slate-400 hover:bg-white/5 hover:text-white"><Square className="size-3.5 fill-current" /></button><button onClick={playPattern} aria-label={playing ? 'Pausar' : 'Reproducir'} className="flex size-9 items-center justify-center rounded-lg bg-fuchsia-500 text-white shadow-[0_0_15px_rgba(217,70,239,0.35)] hover:bg-fuchsia-400">{playing ? <Pause className="size-4 fill-current" /> : <Play className="size-4 fill-current" />}</button><div className="mx-2 h-6 w-px bg-white/10" /><label className="flex items-center gap-2 px-2 text-xs text-slate-400"><span className="uppercase tracking-wider">BPM</span><input aria-label="Tempo" type="number" min="60" max="220" value={tempo} onChange={(event) => setTempo(Number(event.target.value))} className="w-12 bg-transparent text-center font-mono text-sm font-semibold text-white outline-none" /></label></div><div className="flex items-center gap-5 font-mono text-xs text-slate-500"><span>4/4</span><span className="text-slate-300">{status}</span><span className="flex items-center gap-1.5 text-emerald-400"><span className="size-1.5 rounded-full bg-emerald-400 shadow-[0_0_8px_#34d399]" /> 48 kHz / 32-bit</span></div></div></section>
+    <div className="mx-auto grid max-w-[1500px] gap-5 p-4 lg:grid-cols-[1fr_330px] lg:p-7"><div className="min-w-0"><div className="mb-4 flex items-end justify-between"><div><p className="mb-1 text-xs font-medium uppercase tracking-[0.24em] text-fuchsia-400">{activeTab === 'mix' ? 'Pattern editor' : 'Mastering suite'}</p><h1 className="text-2xl font-semibold tracking-tight">{activeTab === 'mix' ? 'Hardstyle foundation' : 'Professional one-track master'}</h1></div><div className="flex gap-2"><button aria-label="Deshacer" className="rounded-md border border-white/10 p-2 text-slate-400 hover:text-white"><Undo2 className="size-4" /></button><button aria-label="Ajustes" className="rounded-md border border-white/10 p-2 text-slate-400 hover:text-white"><Settings2 className="size-4" /></button></div></div>{activeTab === 'mix' ? <><section className="overflow-x-auto rounded-xl border border-white/[0.09] bg-[#11121a] shadow-2xl"><div className="flex min-w-[850px] items-center border-b border-white/[0.08] bg-[#171821] px-4 py-3 text-[10px] font-medium uppercase tracking-[0.18em] text-slate-500"><div className="w-40">Tracks</div><div className="flex flex-1 justify-between pr-1">{[1,2,3,4,5,6,7,8].map((bar) => <span key={bar} className={bar === 1 ? 'text-fuchsia-400' : ''}>{bar}</span>)}</div></div><div className="min-w-[850px] p-4">{tracks.map((track) => <div key={track.name} className="flex h-20 items-center border-b border-white/[0.05] last:border-b-0"><div className="flex w-40 shrink-0 items-center gap-3"><div className={`flex size-8 items-center justify-center rounded-md ${track.tone}`}><Activity className="size-4" /></div><div><p className="text-xs font-semibold tracking-wider text-slate-200">{track.name}</p><p className="text-[10px] text-slate-500">{track.sub}</p></div></div><div className="grid flex-1 grid-cols-32 gap-1">{steps.map((step) => { const isActive = activeSteps[track.name].includes(step); const isBeat = step % 4 === 0; return <button key={step} aria-label={`${track.name} paso ${step + 1}`} onClick={() => toggleStep(track.name, step)} className={`h-11 rounded-sm border transition-all ${isActive ? `${track.active} shadow-[0_0_12px_rgba(244,63,94,0.32)]` : `border-white/[0.06] ${isBeat ? 'bg-white/[0.06]' : 'bg-white/[0.025]'} hover:bg-white/10`}`} /> })}</div></div>)}</div><div className="flex min-w-[850px] items-center justify-between border-t border-white/[0.08] bg-[#0d0e14] px-4 py-3"><span className="text-xs text-slate-500">{totalHits} pasos activos</span><button onClick={() => setStatus('Pista nueva preparada')} className="flex items-center gap-2 rounded-md border border-white/10 px-3 py-2 text-xs text-slate-300 hover:bg-white/5"><Plus className="size-3.5" /> Añadir pista</button></div></section><div className="mt-5 grid gap-5 md:grid-cols-2"><section className="rounded-xl border border-white/[0.09] bg-[#11121a] p-5"><div className="mb-5 flex items-center justify-between"><div><p className="text-xs font-medium uppercase tracking-[0.18em] text-cyan-300">Synthesis</p><h2 className="mt-1 font-semibold">Punch Generator</h2></div><KeyboardMusic className="size-5 text-cyan-300" /></div><div className="grid grid-cols-3 gap-4">{['Pitch 48%', 'Drive 72%', 'Click 36%'].map((item) => <div key={item}><p className="text-[10px] uppercase tracking-wider text-slate-500">{item}</p><div className="mt-2 h-1.5 rounded-full bg-white/10"><div className="h-full w-2/3 rounded-full bg-cyan-400" /></div></div>)}</div><button onClick={() => setStatus('Variación generada')} className="mt-6 flex w-full items-center justify-center gap-2 rounded-md border border-cyan-400/20 bg-cyan-400/10 py-2 text-xs font-medium text-cyan-300 hover:bg-cyan-400/20"><WandSparkles className="size-3.5" /> Generar variación</button></section><section className="rounded-xl border border-white/[0.09] bg-[#11121a] p-5"><div className="mb-5 flex items-center justify-between"><div><p className="text-xs font-medium uppercase tracking-[0.18em] text-amber-300">Master bus</p><h2 className="mt-1 font-semibold">Control room</h2></div><Gauge className="size-5 text-amber-300" /></div><div className="flex items-end justify-around gap-4"><div className="flex h-20 w-2 flex-col justify-end rounded-full bg-white/10"><div className="h-[72%] rounded-full bg-gradient-to-t from-amber-400 to-rose-400" /></div><div className="flex-1"><p className="text-[10px] uppercase tracking-wider text-slate-500">Loudness</p><p className="mt-1 font-mono text-xl">-8.2 <span className="text-xs text-slate-500">LUFS</span></p></div><div className="text-right"><p className="text-[10px] uppercase tracking-wider text-slate-500">Ceiling</p><p className="mt-1 font-mono text-xl">-0.3 <span className="text-xs text-slate-500">dB</span></p></div></div></section></div></> : <MasteringPanel sourceName={sourceName} onLoad={loadAudio} onExport={exportMaster} sourceBuffer={sourceBuffer} masterGain={masterGain} setMasterGain={setMasterGain} threshold={threshold} setThreshold={setThreshold} release={release} setRelease={setRelease} />}</div>
+      <aside className="rounded-xl border border-white/[0.09] bg-[#11121a] p-5"><div className="mb-5 flex items-center justify-between"><div><p className="text-xs font-medium uppercase tracking-[0.18em] text-fuchsia-400">Studio rack</p><h2 className="mt-1 text-lg font-semibold">{activeTab === 'mix' ? 'Mixer' : 'Modo activo'}</h2></div><SlidersHorizontal className="size-5 text-slate-400" /></div><div className="mb-5 flex rounded-lg bg-[#0b0c11] p-1"><button onClick={() => setActiveTab('mix')} className={`flex-1 rounded-md py-2 text-xs font-medium ${activeTab === 'mix' ? 'bg-white/10 text-white' : 'text-slate-500'}`}>Mezcla</button><button onClick={() => setActiveTab('master')} className={`flex-1 rounded-md py-2 text-xs font-medium ${activeTab === 'master' ? 'bg-fuchsia-500/20 text-fuchsia-300' : 'text-slate-500'}`}>Mastering</button></div>{activeTab === 'mix' ? <div className="flex flex-col gap-3">{tracks.map((track) => <div key={track.name} className="rounded-lg border border-white/[0.07] bg-[#171821] p-3"><div className="mb-3 flex items-center justify-between"><span className="text-xs font-semibold tracking-widest text-slate-200">{track.name}</span><div className="flex gap-1"><button onClick={() => toggleList(setMuted, muted, track.name)} className={`rounded px-1.5 py-1 text-[9px] font-bold ${muted.includes(track.name) ? 'bg-rose-500 text-white' : 'text-slate-500 hover:bg-white/10'}`}>M</button><button onClick={() => toggleList(setSolo, solo, track.name)} className={`rounded px-1.5 py-1 text-[9px] font-bold ${solo.includes(track.name) ? 'bg-amber-400 text-black' : 'text-slate-500 hover:bg-white/10'}`}>S</button></div></div><div className="flex items-center gap-3"><Volume2 className="size-3.5 text-slate-500" /><div className="h-1.5 flex-1 rounded-full bg-white/10"><div className={`h-full rounded-full ${track.meter}`} style={{ width: `${track.name === 'KICK' ? 86 : track.name === 'CLAP' ? 70 : 58}%` }} /></div><span className="w-8 text-right font-mono text-[10px] text-slate-500">{muted.includes(track.name) ? '-∞' : '-6 dB'}</span></div></div>)}</div> : <div className="flex flex-col gap-4 text-sm text-slate-400"><div className="rounded-lg border border-fuchsia-400/20 bg-fuchsia-400/10 p-4"><FileAudio className="mb-3 size-5 text-fuchsia-300" /><p className="font-medium text-slate-100">Mastering profesional</p><p className="mt-1 text-xs leading-5">Cadena estéreo con EQ, compresor y ganancia de salida.</p></div><p className="text-xs">Exportación fija: <span className="font-mono text-fuchsia-300">WAV · 48 kHz · 32-bit float</span></p></div>}</aside></div>
+    <footer className="mx-auto flex max-w-[1500px] items-center justify-between border-t border-white/[0.08] px-4 py-5 text-[10px] text-slate-600 lg:px-7"><span className="flex items-center gap-2"><Headphones className="size-3.5" /> Atajos: Espacio para reproducir · M para silenciar</span><span className="flex items-center gap-2"><CircleHelp className="size-3.5" /> {status}</span></footer>
+  </main>
 }
+
+function MasteringPanel({ sourceName, onLoad, onExport, sourceBuffer, masterGain, setMasterGain, threshold, setThreshold, release, setRelease }: { sourceName: string; onLoad: (event: ChangeEvent<HTMLInputElement>) => void; onExport: () => void; sourceBuffer: AudioBuffer | null; masterGain: number; setMasterGain: (value: number) => void; threshold: number; setThreshold: (value: number) => void; release: number; setRelease: (value: number) => void }) {
+  return <section className="flex flex-col gap-5"><div className="rounded-xl border border-fuchsia-400/20 bg-gradient-to-br from-fuchsia-500/10 to-[#11121a] p-5"><div className="flex flex-wrap items-center justify-between gap-4"><div><p className="text-xs uppercase tracking-[0.2em] text-fuchsia-300">One-track mastering</p><h2 className="mt-1 text-lg font-semibold">Cadena profesional de salida</h2><p className="mt-2 max-w-xl text-sm text-slate-400">Carga una mezcla estéreo, ajusta dinámica y exporta un WAV float de alta resolución.</p></div><label className="flex cursor-pointer items-center gap-2 rounded-md bg-fuchsia-500 px-4 py-2 text-xs font-semibold text-white hover:bg-fuchsia-400"><Upload className="size-3.5" /> Cargar pista<input className="sr-only" type="file" accept="audio/*" onChange={onLoad} /></label></div><div className="mt-5 flex items-center gap-3 rounded-lg border border-white/10 bg-black/20 p-3"><FileAudio className="size-5 text-fuchsia-300" /><div className="min-w-0 flex-1"><p className="truncate text-sm text-slate-200">{sourceName}</p><p className="text-xs text-slate-500">{sourceBuffer ? `${sourceBuffer.numberOfChannels} canales · ${sourceBuffer.duration.toFixed(2)} s` : 'WAV, MP3, AIFF o cualquier formato compatible'}</p></div>{sourceBuffer && <span className="rounded-full bg-emerald-400/10 px-2 py-1 text-[10px] text-emerald-300">Listo</span>}</div></div><div className="grid gap-5 md:grid-cols-2"><section className="rounded-xl border border-white/[0.09] bg-[#11121a] p-5"><div className="mb-5 flex items-center justify-between"><div><p className="text-xs uppercase tracking-[0.18em] text-cyan-300">Procesamiento</p><h2 className="mt-1 font-semibold">Dynamics & tone</h2></div><Gauge className="size-5 text-cyan-300" /></div><Control label="Threshold" value={threshold} min={-24} max={0} unit="dB" onChange={setThreshold} /><Control label="Release" value={release} min={20} max={300} unit="ms" onChange={setRelease} /><Control label="Output gain" value={masterGain} min={-6} max={6} unit="dB" onChange={setMasterGain} /></section><section className="rounded-xl border border-white/[0.09] bg-[#11121a] p-5"><div className="mb-5 flex items-center justify-between"><div><p className="text-xs uppercase tracking-[0.18em] text-amber-300">Metering</p><h2 className="mt-1 font-semibold">Loudness target</h2></div><Activity className="size-5 text-amber-300" /></div><div className="flex h-28 items-end gap-1 rounded-lg bg-black/20 p-3">{[40,55,68,72,64,78,70,84,74,66,80,58,72,88,76,63,70,82,68,75].map((height, index) => <span key={index} className="flex-1 rounded-t bg-gradient-to-t from-fuchsia-500 to-cyan-300" style={{ height: `${height}%` }} />)}</div><div className="mt-4 flex justify-between font-mono text-xs text-slate-500"><span>-24</span><span className="text-amber-300">-9 LUFS integrated</span><span>0 dB</span></div><button onClick={onExport} className="mt-5 flex w-full items-center justify-center gap-2 rounded-md bg-amber-400 py-3 text-xs font-bold text-black hover:bg-amber-300"><Download className="size-3.5" /> Exportar master WAV</button></section></div></section>
+}
+
+function Control({ label, value, min, max, unit, onChange }: { label: string; value: number; min: number; max: number; unit: string; onChange: (value: number) => void }) { return <label className="mb-5 block last:mb-0"><div className="mb-2 flex justify-between text-xs"><span className="text-slate-400">{label}</span><span className="font-mono text-cyan-300">{value} {unit}</span></div><input className="w-full accent-cyan-400" type="range" min={min} max={max} step="1" value={value} onChange={(event) => onChange(Number(event.target.value))} /></label> }
